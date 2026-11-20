@@ -29,8 +29,46 @@ jobs:
       - name: Create Android project
         run: flutter create . --platforms=android --org uz.imkonai
 
+      - name: Configure Android permissions
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("android/app/src/main/AndroidManifest.xml")
+          text = path.read_text()
+
+          permissions = [
+              "android.permission.INTERNET",
+              "android.permission.RECORD_AUDIO",
+              "android.permission.CAMERA",
+              "android.permission.WAKE_LOCK",
+              "android.permission.FOREGROUND_SERVICE",
+              "android.permission.POST_NOTIFICATIONS",
+              "android.permission.CALL_PHONE",
+              "android.permission.SEND_SMS",
+              "android.permission.READ_CONTACTS",
+              "android.permission.MODIFY_AUDIO_SETTINGS",
+              "android.permission.FLASHLIGHT"
+          ]
+
+          additions = "".join(
+              f'    <uses-permission android:name="{p}" />\n'
+              for p in permissions
+          )
+
+          if "android.permission.INTERNET" not in text:
+              text = text.replace("<manifest", "<manifest", 1)
+              pos = text.find(">")
+              text = text[:pos+1] + "\n" + additions + text[pos+1:]
+
+          path.write_text(text)
+          PY
+
       - name: Get dependencies
         run: flutter pub get
+
+      - name: Analyze Flutter project
+        run: flutter analyze
 
       - name: Build APK
         run: flutter build apk --release
