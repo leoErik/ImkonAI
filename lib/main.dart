@@ -1,7 +1,11 @@
 
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:permission_handler/permission_handler.dart';
+import 'package:http/http.dart' as http;
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -38,6 +42,12 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  static const String apiKey = String.fromEnvironment(
+    'GEMINI_API_KEY',
+  );
+
+  static const String model = 'gemini-3.8-flash';
+
   final stt.SpeechToText speech = stt.SpeechToText();
   final FlutterTts tts = FlutterTts();
   final TextEditingController controller = TextEditingController();
@@ -48,6 +58,7 @@ class _HomePageState extends State<HomePage> {
   bool isListening = false;
   bool speechAvailable = false;
   bool isSpeaking = false;
+  bool isThinking = false;
 
   String selectedLanguage = 'O‘zbekcha';
   String selectedVoice = 'Ayol';
@@ -72,6 +83,15 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> initializeSpeech() async {
     try {
+      final permission = await Permission.microphone.request();
+
+      if (!permission.isGranted) {
+        if (mounted) {
+          showMessage('Mikrofon uchun ruxsat berilmadi.');
+        }
+        return;
+      }
+
       speechAvailable = await speech.initialize(
         onStatus: (status) {
           if (mounted) {
@@ -82,9 +102,7 @@ class _HomePageState extends State<HomePage> {
         },
         onError: (error) {
           if (mounted) {
-            setState(() {
-              isListening = false;
-            });
+            setState(() => isListening = false);
           }
         },
       );
@@ -97,10 +115,6 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> initializeTts() async {
-    await tts.setLanguage(languageCode);
-    await tts.setSpeechRate(0.48);
-    await tts.setPitch(1.0);
-
     tts.setStartHandler(() {
       if (mounted) setState(() => isSpeaking = true);
     });
@@ -112,12 +126,20 @@ class _HomePageState extends State<HomePage> {
     tts.setErrorHandler((message) {
       if (mounted) setState(() => isSpeaking = false);
     });
+
+    await tts.setLanguage(languageCode);
+    await tts.setSpeechRate(0.48);
+    await tts.setPitch(1.0);
   }
 
   Future<void> speak(String text) async {
-    await tts.stop();
-    await tts.setLanguage(languageCode);
-    await tts.speak(text);
+    try {
+      await tts.stop();
+      await tts.setLanguage(languageCode);
+      await tts.speak(text);
+    } catch (e) {
+      if (mounted) showMessage('Ovoz chiqarishda xatolik yuz berdi.');
+    }
   }
 
   Future<void> startListening() async {
@@ -132,12 +154,14 @@ class _HomePageState extends State<HomePage> {
 
     await tts.stop();
 
-    await speech.listen(
-      localeId: languageCode,
-      listenFor: const Duration(seconds: 30),
-      pauseFor: const Duration(seconds: 4),
-      onResult: (result) {
-        if (mounted) {
+    try {
+      await speech.listen(
+        localeId: languageCode,
+        listenFor: const Duration(seconds: 30),
+        pauseFor: const Duration(seconds: 4),
+        onResult: (result) {
+          if (!mounted) return;
+
           setState(() {
             controller.text = result.recognizedWords;
             controller.selection = TextSelection.fromPosition(
@@ -148,11 +172,13 @@ class _HomePageState extends State<HomePage> {
           if (result.finalResult) {
             sendMessage();
           }
-        }
-      },
-    );
+        },
+      );
 
-    if (mounted) setState(() => isListening = true);
+      if (mounted) setState(() => isListening = true);
+    } catch (e) {
+      showMessage('Mikrofonni ishga tushirib bo‘lmadi.');
+    }
   }
 
   Future<void> stopListening() async {
@@ -169,9 +195,7 @@ class _HomePageState extends State<HomePage> {
   String getDateTimeAnswer() {
     final now = DateTime.now();
 
-    final date =
-        '${now.day}.${now.month}.${now.year}';
-
+    final date = '${now.day}.${now.month}.${now.year}';
     final time =
         '${now.hour.toString().padLeft(2, '0')}:'
         '${now.minute.toString().padLeft(2, '0')}';
@@ -186,62 +210,156 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  String getOfflineAnswer(String question) {
+  String? getOfflineAnswer(String question) {
     final q = question.toLowerCase();
 
     if (q.contains('vaqt') ||
         q.contains('soat') ||
         q.contains('time') ||
-        q.contains('время')) {
-      return getDateTimeAnswer();
-    }
-
-    if (q.contains('sana') ||
+        q.contains('время') ||
+        q.contains('sana') ||
         q.contains('bugun') ||
         q.contains('date') ||
         q.contains('сегодня')) {
       return getDateTimeAnswer();
     }
 
-    switch (selectedLanguage) {
-      case 'Русский':
-        return 'Я ImkonAI. Для полноценных ответов искусственного '
-            'интеллекта необходимо подключение к интернету.';
-      case 'English':
-        return 'I am ImkonAI. An internet connection is needed '
-            'for full AI answers.';
-      default:
-        return 'Men ImkonAI yordamchisiman. Hozircha oddiy '
-            'buyruqlarni bajara olaman. To‘liq sun’iy intellekt '
-            'javoblari uchun internet ulanishini sozlash kerak.';
-    }
+    return null;
   }
 
-  void sendMessage() {
+  Future<String> askGemini(String question) async {
+    if (apiKey.isEmpty) {
+      throw Exception(
+        'Gemini API kaliti topilmadi. GitHub sozlamalarini tekshiring.',
+      );
+    }
+
+    final uri = Uri.https(
+      'generativelanguage.googleapis.com',
+      '/v1beta/models/$model:generateContent',
+    );
+
+    final history = messages
+        .where((m) => m['role'] == 'user' || m['role'] == 'ai')
+        .toList();
+
+    final contents = history
+        .take(16)
+        .map((message) {
+          return {
+            'role': message['role'] == 'ai' ? 'model' : 'user',
+            'parts': [
+              {'text': message['text'] ?? ''}
+            ],
+          };
+        })
+        .toList();
+
+    final response = await http
+        .post(
+          uri,
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': apiKey,
+          },
+          body: jsonEncode({
+            'systemInstruction': {
+              'parts': [
+                {
+                  'text':
+                      'Siz ImkonAI nomli aqlli yordamchisiz. '
+                      'Foydalanuvchiga doimo hurmat bilan Siz deb murojaat qiling. '
+                      'O‘zbek, rus va ingliz tillarida javob bera olasiz. '
+                      'Savol qaysi tilda berilsa, shu tilda aniq va tushunarli javob bering. '
+                      'Bilmagan narsangizni to‘qib chiqarmang.'
+                }
+              ]
+            },
+            'contents': contents,
+            'generationConfig': {
+              'temperature': 0.7,
+              'maxOutputTokens': 2048,
+            },
+          }),
+        )
+        .timeout(const Duration(seconds: 60));
+
+    final data = jsonDecode(response.body);
+
+    if (response.statusCode != 200) {
+      final error = data['error']?['message'] ??
+          'Gemini serverida xatolik: ${response.statusCode}';
+      throw Exception(error);
+    }
+
+    final parts = data['candidates']?[0]?['content']?['parts'];
+
+    if (parts == null || parts.isEmpty) {
+      throw Exception('Gemini javob qaytarmadi.');
+    }
+
+    final answer = parts
+        .map((part) => part['text'] ?? '')
+        .join()
+        .trim();
+
+    if (answer.isEmpty) {
+      throw Exception('Gemini javobi bo‘sh.');
+    }
+
+    return answer;
+  }
+
+  Future<void> sendMessage() async {
     final text = controller.text.trim();
 
-    if (text.isEmpty) return;
+    if (text.isEmpty || isThinking) return;
+
+    FocusScope.of(context).unfocus();
+    await stopListening();
 
     setState(() {
       messages.add({
         'role': 'user',
         'text': text,
       });
+      controller.clear();
+      isThinking = true;
     });
 
-    controller.clear();
-
-    final answer = getOfflineAnswer(text);
-
-    setState(() {
-      messages.add({
-        'role': 'ai',
-        'text': answer,
-      });
-    });
-
-    speak(answer);
     scrollToBottom();
+
+    try {
+      final offlineAnswer = getOfflineAnswer(text);
+      final answer = offlineAnswer ?? await askGemini(text);
+
+      if (!mounted) return;
+
+      setState(() {
+        messages.add({
+          'role': 'ai',
+          'text': answer,
+        });
+      });
+
+      scrollToBottom();
+      await speak(answer);
+    } catch (e) {
+      if (!mounted) return;
+
+      final errorText = e.toString().replaceFirst('Exception: ', '');
+
+      setState(() {
+        messages.add({
+          'role': 'ai',
+          'text': 'Kechirasiz, javob olishda xatolik yuz berdi:\n$errorText',
+        });
+      });
+
+      scrollToBottom();
+    } finally {
+      if (mounted) setState(() => isThinking = false);
+    }
   }
 
   void scrollToBottom() {
@@ -259,10 +377,7 @@ class _HomePageState extends State<HomePage> {
   Future<void> changeLanguage(String? value) async {
     if (value == null) return;
 
-    setState(() {
-      selectedLanguage = value;
-    });
-
+    setState(() => selectedLanguage = value);
     await tts.setLanguage(languageCode);
     showMessage('Til o‘zgartirildi: $value');
   }
@@ -270,13 +385,10 @@ class _HomePageState extends State<HomePage> {
   Future<void> changeVoice(String? value) async {
     if (value == null) return;
 
-    setState(() {
-      selectedVoice = value;
-    });
-
+    setState(() => selectedVoice = value);
     showMessage(
-      'Tanlangan ovoz: $value. Mavjud ovozlar telefoningizdagi '
-      'TTS xizmatiga bog‘liq.',
+      'Tanlangan ovoz: $value. Ovoz turi telefoningizdagi '
+      'TTS ovozlariga bog‘liq.',
     );
   }
 
@@ -364,78 +476,7 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
           IconButton(
-            onPressed: () {
-              showModalBottomSheet(
-                context: context,
-                backgroundColor: const Color(0xFF171D3A),
-                builder: (context) {
-                  return Padding(
-                    padding: const EdgeInsets.all(22),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Text(
-                          'Sozlamalar',
-                          style: TextStyle(
-                            fontSize: 21,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        const SizedBox(height: 20),
-                        DropdownButtonFormField<String>(
-                          value: selectedLanguage,
-                          decoration: const InputDecoration(
-                            labelText: 'Tilni tanlang',
-                            border: OutlineInputBorder(),
-                          ),
-                          items: const [
-                            DropdownMenuItem(
-                              value: 'O‘zbekcha',
-                              child: Text('O‘zbekcha'),
-                            ),
-                            DropdownMenuItem(
-                              value: 'Русский',
-                              child: Text('Русский'),
-                            ),
-                            DropdownMenuItem(
-                              value: 'English',
-                              child: Text('English'),
-                            ),
-                          ],
-                          onChanged: (value) {
-                            changeLanguage(value);
-                            Navigator.pop(context);
-                          },
-                        ),
-                        const SizedBox(height: 16),
-                        DropdownButtonFormField<String>(
-                          value: selectedVoice,
-                          decoration: const InputDecoration(
-                            labelText: 'Ovoz tanlash',
-                            border: OutlineInputBorder(),
-                          ),
-                          items: const [
-                            DropdownMenuItem(
-                              value: 'Ayol',
-                              child: Text('Ayol ovozi'),
-                            ),
-                            DropdownMenuItem(
-                              value: 'Erkak',
-                              child: Text('Erkak ovozi'),
-                            ),
-                          ],
-                          onChanged: (value) {
-                            changeVoice(value);
-                            Navigator.pop(context);
-                          },
-                        ),
-                        const SizedBox(height: 20),
-                      ],
-                    ),
-                  );
-                },
-              );
-            },
+            onPressed: openSettings,
             icon: const Icon(
               Icons.settings,
               color: Colors.white,
@@ -444,6 +485,79 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
       ),
+    );
+  }
+
+  void openSettings() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF171D3A),
+      builder: (context) {
+        return Padding(
+          padding: const EdgeInsets.all(22),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Sozlamalar',
+                style: TextStyle(
+                  fontSize: 21,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 20),
+              DropdownButtonFormField<String>(
+                value: selectedLanguage,
+                decoration: const InputDecoration(
+                  labelText: 'Tilni tanlang',
+                  border: OutlineInputBorder(),
+                ),
+                items: const [
+                  DropdownMenuItem(
+                    value: 'O‘zbekcha',
+                    child: Text('O‘zbekcha'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'Русский',
+                    child: Text('Русский'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'English',
+                    child: Text('English'),
+                  ),
+                ],
+                onChanged: (value) {
+                  changeLanguage(value);
+                  Navigator.pop(context);
+                },
+              ),
+              const SizedBox(height: 16),
+              DropdownButtonFormField<String>(
+                value: selectedVoice,
+                decoration: const InputDecoration(
+                  labelText: 'Ovoz tanlash',
+                  border: OutlineInputBorder(),
+                ),
+                items: const [
+                  DropdownMenuItem(
+                    value: 'Ayol',
+                    child: Text('Ayol ovozi'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'Erkak',
+                    child: Text('Erkak ovozi'),
+                  ),
+                ],
+                onChanged: (value) {
+                  changeVoice(value);
+                  Navigator.pop(context);
+                },
+              ),
+              const SizedBox(height: 20),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -483,9 +597,11 @@ class _HomePageState extends State<HomePage> {
           Text(
             isListening
                 ? 'Sizni tinglayapman...'
-                : isSpeaking
-                    ? 'Javob bermoqdaman...'
-                    : 'Assalomu alaykum!',
+                : isThinking
+                    ? 'Gemini javob tayyorlamoqda...'
+                    : isSpeaking
+                        ? 'Javob bermoqdaman...'
+                        : 'Assalomu alaykum!',
             style: const TextStyle(
               fontSize: 20,
               fontWeight: FontWeight.w600,
@@ -590,7 +706,7 @@ class _HomePageState extends State<HomePage> {
           ),
           const SizedBox(width: 8),
           IconButton(
-            onPressed: sendMessage,
+            onPressed: isThinking ? null : sendMessage,
             icon: const Icon(
               Icons.send_rounded,
               color: Color(0xFF9C83FF),
@@ -598,9 +714,9 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
           Container(
-            decoration: BoxDecoration(
+            decoration: const BoxDecoration(
               shape: BoxShape.circle,
-              gradient: const LinearGradient(
+              gradient: LinearGradient(
                 colors: [
                   Color(0xFF536DFF),
                   Color(0xFFB44BFF),
